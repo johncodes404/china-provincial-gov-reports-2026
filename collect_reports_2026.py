@@ -25,6 +25,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
@@ -87,6 +88,22 @@ class ReportRecord:
 
 
 RecordCallback = Optional[Callable[[ReportRecord], None]]
+PRIORITY_CONTENT_SELECTORS = (
+    ".article-content",
+    ".DocHtmlCon",
+    ".TRS_UEDITOR",
+    ".trs_editor_view",
+    ".view",
+    ".conm",
+    ".m-cente-detail",
+    ".m-new-main-content",
+    "td.zhengwen",
+    ".content",
+    ".detail-content",
+    ".news_content",
+)
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def parse_args() -> argparse.Namespace:
@@ -289,12 +306,51 @@ def clean_paragraph_text(text: str) -> str:
     return cleaned.strip()
 
 
+def decode_response_html(resp: requests.Response) -> str:
+    encoding = (resp.encoding or "").lower()
+    apparent = (resp.apparent_encoding or "").lower()
+    chosen = apparent or encoding or "utf-8"
+    if encoding and encoding not in ("iso-8859-1", "latin-1"):
+        chosen = encoding
+    try:
+        return resp.content.decode(chosen, errors="ignore")
+    except Exception:
+        return resp.text
+
+
+def trim_report_text(text: str) -> str:
+    if not text:
+        return ""
+    for marker in ("政府工作报告", "各位代表："):
+        idx = text.find(marker)
+        if idx != -1 and idx <= 300:
+            text = text[idx:]
+            break
+    text = re.sub(r"^\s*发布日期[:：]?\s*\d{4}-\d{2}-\d{2}.*?\n", "", text)
+    return clean_paragraph_text(text)
+
+
 def extract_main_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(
         ["script", "style", "noscript", "iframe", "svg", "form", "nav", "footer", "header", "aside"]
     ):
         tag.decompose()
+
+    for selector in PRIORITY_CONTENT_SELECTORS:
+        nodes = soup.select(selector)
+        if not nodes:
+            continue
+        texts = []
+        for node in nodes:
+            for br in node.find_all("br"):
+                br.replace_with("\n")
+            text = node.get_text("\n", strip=True)
+            if len(text) >= 200:
+                texts.append(text)
+        if texts:
+            longest = max(texts, key=len)
+            return trim_report_text(longest)
 
     body = soup.body or soup
     candidates = []
@@ -312,16 +368,28 @@ def extract_main_text_from_html(html: str) -> str:
         br.replace_with("\n")
 
     text = target.get_text("\n", strip=True)
-    return clean_paragraph_text(text)
+    return trim_report_text(text)
 
 
 def extract_page_title_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
-    for selector in ("h1", "h2", ".title", ".article-title", ".detail-title"):
-        node = soup.select_one(selector)
-        if node:
+    for selector in (
+        "h1",
+        ".article-title",
+        ".detail-title",
+        ".arti_title",
+        ".news-title",
+        ".bt",
+        "h2",
+        ".title",
+    ):
+        for node in soup.select(selector):
             value = clean_paragraph_text(node.get_text(" ", strip=True))
-            if value:
+            if not value:
+                continue
+            if "首页 >" in value or value.startswith("首页 >"):
+                continue
+            if "政府工作报告" in value or len(value) >= 10:
                 return value
     if soup.title and soup.title.string:
         title = clean_paragraph_text(soup.title.string)
@@ -397,6 +465,22 @@ def score_record(record: ReportRecord, province: ProvinceSpec, min_text_length: 
     else:
         score -= 30
     return score
+
+
+def normalize_report_title(title: str, province: ProvinceSpec, year: int = 2026) -> str:
+    value = clean_paragraph_text(title)
+    if not value:
+        return f"{year}年{province.province}政府工作报告"
+    value = re.split(r"\s*[-|_]\s*", value)[0].strip()
+    value = value.replace("（全文）", "").replace("(全文)", "")
+    value = re.sub(r"[，,]?\s*全文来了！？?$", "", value)
+    if "政府工作报告" not in value:
+        return f"{year}年{province.province}政府工作报告"
+    if not any(alias in value for alias in province.aliases):
+        return f"{year}年{province.province}政府工作报告"
+    if not value.startswith(f"{year}年"):
+        return f"{year}年{province.province}政府工作报告"
+    return value
 
 
 def read_manual_fallback_urls(path: Path) -> Dict[str, str]:
@@ -907,7 +991,7 @@ class OfficialFallbackCollector:
 
     def _fetch_record_from_url(self, url: str, province: ProvinceSpec) -> Optional[ReportRecord]:
         try:
-            resp = self.session.get(url, timeout=self.timeout_sec, allow_redirects=True)
+            resp = self.session.get(url, timeout=self.timeout_sec, allow_redirects=True, verify=False)
             resp.raise_for_status()
         except Exception:
             return None
@@ -916,8 +1000,8 @@ class OfficialFallbackCollector:
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
             return None
 
-        html = resp.text
-        title = extract_page_title_from_html(html)
+        html = decode_response_html(resp)
+        title = normalize_report_title(extract_page_title_from_html(html), province)
         if not title_matches_province(title, province):
             body_text = clean_paragraph_text(BeautifulSoup(html, "lxml").get_text(" ", strip=True))
             if not title_matches_province(body_text[:120], province):
